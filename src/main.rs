@@ -1,3 +1,5 @@
+#![feature(iter_array_chunks)]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -13,14 +15,13 @@ mod image;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-
     /// Port on which to list for incoming requests
     #[arg(short, long, default_value_t = 5005)]
     port: u16,
 
     /// Path to directory where images are stored
     #[arg(short, long, default_value_t = String::from("images-dir"))]
-    image_dir: String
+    image_dir: String,
 }
 
 fn handle_client(mut stream: TcpStream, dir: &str) {
@@ -58,7 +59,6 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
         pb.set_width(Some(loading_bar_width));
 
         for row in 0..height {
-
             let mut mode = [0u8];
             let mut codes = vec![0; width];
 
@@ -67,14 +67,15 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
                 return;
             };
 
-            if mode[0] == 0 { // normal mode
+            if mode[0] == 0 {
+                // normal mode
 
                 let Ok(_) = stream.read_exact(&mut codes) else {
                     println!("Error reading row {row}");
                     return;
                 };
-            }
-            else { // compressed mode
+            } else {
+                // compressed mode
 
                 let mut segments_bytes = vec![0u8; 2 * (mode[0] as usize)];
                 let mut segments = vec![0u16; mode[0] as usize];
@@ -84,34 +85,29 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
                     return;
                 };
 
-                for (i, &e) in segments_bytes.iter().enumerate() {
-
-                    if i % 2 == 1 {
-                        segments[i / 2] |= (e as u16) << 8;
-                    }
-                    else {
-                        segments[i / 2] = e as u16;
-                    }
-                }
+                segments
+                    .iter_mut()
+                    .zip(segments_bytes.into_iter().array_chunks::<2>())
+                    .for_each(|(seg, pair)| *seg = u16::from_le_bytes(pair));
 
                 let mut idx = 0;
                 for &segment in segments.iter() {
-
                     let code = (segment & 0xF) as u8;
-                    let count = (segment >> 4) & 0x1FF;
+                    let count = ((segment >> 4) & 0x1FF) as usize;
 
-                    for _ in 0..count {
-                        codes[idx] = code;
-                        idx += 1;
-                    }
+                    codes
+                        .iter_mut()
+                        .skip(idx)
+                        .take(count)
+                        .for_each(|v| *v = code);
+                    idx += count;
                 }
             }
             img.push(codes.iter().map(|&v| code_2_color(v).unwrap()).collect());
 
             pb.inc();
         }
-        pb.finish();
-        println!();
+        pb.finish_println("");
 
         save_bmp_image(&img, &format!("{dir}/image_{name}"));
     } else if rw == 2 {
@@ -135,7 +131,6 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
                 println!("Not able to send row {i}");
                 return;
             };
-
             pb.inc();
         }
         pb.finish_println("");
@@ -143,7 +138,6 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
 }
 
 fn main() {
-
     let args = Args::parse();
 
     // Define the host and port to listen on
@@ -155,13 +149,11 @@ fn main() {
 
     // create the folder where images are stored
     match std::fs::create_dir(&image_dir) {
-
         Ok(()) => println!("Successfully created images directory"),
         Err(err) => {
             if err.kind() == std::io::ErrorKind::AlreadyExists {
                 println!("Found image directory")
-            }
-            else {
+            } else {
                 panic!("Failed to create image directory");
             }
         }
@@ -174,14 +166,12 @@ fn main() {
             if err.kind() == std::io::ErrorKind::PermissionDenied {
                 println!("Permission denied while binding server to port {port}");
                 println!("hint: use sudo on linux");
-            }
-            else {
+            } else {
                 println!("Failed to bind server to port {port}");
             }
             return;
         }
     };
-    // let listener = TcpListener::bind((host, port)).expect("Failed to bind");
 
     // println!("TCP server is listening on {}:{}", host, port);
     println!("Waiting for requests on port {}", port);
@@ -190,7 +180,6 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-
                 let dir = image_dir.clone();
 
                 // Spawn a new thread to handle each client connection

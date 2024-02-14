@@ -5,7 +5,6 @@ use std::io::{Seek, SeekFrom};
 use byteorder::*;
 
 pub fn save_bmp_image(data: &[Vec<u16>], filename: &str) {
-
     let height = data.len();
     let width = data.first().unwrap().len();
 
@@ -51,7 +50,7 @@ pub fn save_bmp_image(data: &[Vec<u16>], filename: &str) {
 
     // Write pixel data
     for row in data.iter().rev() {
-        for &v in row {
+        for &v in row.iter() {
             bmp_file
                 .write_all(&v.to_le_bytes())
                 .expect("Failed to write pixel data");
@@ -66,8 +65,7 @@ pub fn save_bmp_image(data: &[Vec<u16>], filename: &str) {
 
 pub fn load_bmp_image(filename: &str) -> Vec<Vec<u16>> {
     // Open the BMP file
-    let mut bmp_file =
-        File::open(format!("{}.bmp", filename)).expect("Failed to open BMP file");
+    let mut bmp_file = File::open(format!("{}.bmp", filename)).expect("Failed to open BMP file");
 
     // Read the BMP header
     let mut bmp_header = [0; 54];
@@ -110,7 +108,8 @@ pub fn load_bmp_image(filename: &str) -> Vec<Vec<u16>> {
                 .read_exact(&mut color_data)
                 .expect("Failed to read color data");
 
-            *element = u16::from_le_bytes([color_data[0], color_data[1]]);
+            *element = u16::from_le_bytes(color_data);
+            // *element = u16::from_le_bytes([color_data[0], color_data[1]]);
         }
 
         bmp_file
