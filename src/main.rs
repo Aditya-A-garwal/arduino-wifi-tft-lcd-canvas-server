@@ -1,16 +1,17 @@
 #![feature(iter_array_chunks)]
 
+mod image;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
+use byteorder::WriteBytesExt;
 use pbr::ProgressBar;
 
 use clap::Parser;
 
-use crate::image::*;
-
-mod image;
+use image::*;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -41,8 +42,8 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
 
     let rw = buffer[0];
     let name = buffer[1];
-    let height = (buffer[2] as usize) + ((buffer[3] as usize) << 8);
-    let width = (buffer[4] as usize) + ((buffer[5] as usize) << 8);
+    let height = u16::from_le_bytes([buffer[2], buffer[3]]) as usize;
+    let width = u16::from_le_bytes([buffer[4], buffer[5]]) as usize;
 
     if rw == 1 {
         println!(
@@ -113,7 +114,7 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
     } else if rw == 2 {
         println!(
             r#"
-            Sending new image from "{peer}" with
+            Sending new image to "{peer}" with
             Dimensions: {height} x {width}
             name: image_{name}.bmp
             "#
@@ -125,12 +126,65 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
         pb.set_width(Some(loading_bar_width));
 
         for (i, row) in img.iter().enumerate() {
-            let val: Vec<u8> = (*row).iter().map(|&v| color_2_code(v).unwrap()).collect();
+            let mut codes: Vec<u8> = (*row).iter().map(|&v| color_2_code(v).unwrap()).collect();
 
-            let Ok(_) = stream.write_all(&val) else {
-                println!("Not able to send row {i}");
-                return;
+            let segments = {
+                let mut raw = vec![];
+
+                let mut l = 0;
+                while l < codes.len() {
+                    let mut size = 1;
+                    let Some(&lo) = codes.iter().nth(l) else {
+                        break;
+                    };
+
+                    for &hi in codes.iter().skip(1 + l) {
+                        if hi != lo {
+                            break;
+                        }
+
+                        size += 1;
+                    }
+
+                    l += size;
+
+                    raw.push((lo & 0xF) as u16 | ((size & 0x1FF) << 4) as u16);
+                }
+
+                if raw.len() <= 105 {
+                    Some(raw)
+                } else {
+                    None
+                }
             };
+
+            match segments {
+                None => {
+                    codes.insert(0, 0);
+                    let Ok(_) = stream.write_all(&codes) else {
+                        println!("Not able to send row {i}");
+                        return;
+                    };
+                }
+                Some(segments) => {
+                    let Ok(_) = stream.write_u8(segments.len() as u8) else {
+                        println!("Not able to send compressed row {i}");
+                        return;
+                    };
+
+                    let mut raw_data = vec![];
+                    for &segment in segments.iter() {
+                        let x = segment.to_le_bytes();
+                        raw_data.extend(&x);
+                    }
+
+                    let Ok(_) = stream.write(&raw_data) else {
+                        println!("Not able to send compressed row {i}");
+                        return;
+                    };
+                }
+            }
+
             pb.inc();
         }
         pb.finish_println("");

@@ -109,7 +109,6 @@ pub fn load_bmp_image(filename: &str) -> Vec<Vec<u16>> {
                 .expect("Failed to read color data");
 
             *element = u16::from_le_bytes(color_data);
-            // *element = u16::from_le_bytes([color_data[0], color_data[1]]);
         }
 
         bmp_file
