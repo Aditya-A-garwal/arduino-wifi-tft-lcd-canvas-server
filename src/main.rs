@@ -2,16 +2,19 @@
 
 mod image;
 
+use core::time;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::thread;
+use std::thread::{self, Thread};
 
-use byteorder::WriteBytesExt;
+use byteorder::{LittleEndian, WriteBytesExt};
 use pbr::ProgressBar;
 
 use clap::Parser;
 
 use image::*;
+
+const BUFFER_CAPACITY: usize = 640;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -23,6 +26,59 @@ struct Args {
     /// Path to directory where images are stored
     #[arg(short, long, default_value_t = String::from("images-dir"))]
     image_dir: String,
+}
+
+struct BufferedWriter {
+    stream: TcpStream,
+    buf: [u8; BUFFER_CAPACITY],
+    size: usize,
+}
+
+impl BufferedWriter {
+
+    fn new(mut stream: TcpStream) -> Self {
+        BufferedWriter {
+            stream,
+            buf: [0u8; BUFFER_CAPACITY],
+            size: 0,
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) {
+
+        use core::cmp::min;
+
+        let mut idx = 0usize;
+        let mut len = bytes.len();
+
+        while len > 0 {
+
+            if self.size == BUFFER_CAPACITY {
+                self.flush();
+            }
+
+            let mut inc = min(len, BUFFER_CAPACITY - self.size);
+            len -= inc;
+
+            while inc > 0 {
+                self.buf[self.size] = bytes[idx];
+
+                self.size += 1;
+                idx += 1;
+
+                inc -= 1;
+            }
+        };
+    }
+
+    fn flush(&mut self) {
+
+        let _ = self.stream.read_exact(&mut [0u8]);
+        // let _ = self.stream.write_u8(self.size as u8);
+        let _ = self.stream.write_u16::<LittleEndian>(self.size as u16);
+        let _ = self.stream.write_all(&self.buf);
+        self.size = 0;
+    }
 }
 
 fn handle_client(mut stream: TcpStream, dir: &str) {
@@ -70,14 +126,12 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
 
             if mode[0] == 0 {
                 // normal mode
-
                 let Ok(_) = stream.read_exact(&mut codes) else {
                     println!("Error reading row {row}");
                     return;
                 };
             } else {
                 // compressed mode
-
                 let mut segments_bytes = vec![0u8; 2 * (mode[0] as usize)];
                 let mut segments = vec![0u16; mode[0] as usize];
 
@@ -105,8 +159,9 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
                 }
             }
             img.push(codes.iter().map(|&v| code_2_color(v).unwrap()).collect());
-
             pb.inc();
+
+            // thread::sleep(time::Duration::from_millis(5));
         }
         pb.finish_println("");
 
@@ -120,6 +175,8 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
             "#
         );
 
+        let mut client = BufferedWriter::new(stream);
+
         let img = load_bmp_image(&format!("{dir}/image_{name}"));
 
         let mut pb = ProgressBar::new(height as u64);
@@ -128,65 +185,55 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
         for (i, row) in img.iter().enumerate() {
             let mut codes: Vec<u8> = (*row).iter().map(|&v| color_2_code(v).unwrap()).collect();
 
-            let segments = {
-                let mut raw = vec![];
+            let mut segments = vec![];
 
-                let mut l = 0;
-                while l < codes.len() {
-                    let mut size = 1;
-                    let Some(&lo) = codes.iter().nth(l) else {
+            let mut l = 0;
+            let mut r = 0;
+
+            while l < codes.len() {
+
+                let lo = codes[l];
+
+                r = l + 1;
+                while r <= codes.len() {
+                    if (r == codes.len()) || (codes[r] != lo) {
                         break;
-                    };
-
-                    for &hi in codes.iter().skip(1 + l) {
-                        if hi != lo {
-                            break;
-                        }
-
-                        size += 1;
                     }
+                    r += 1;
+                }
+                segments.push((lo & 0xF) as u16 | (((r - l) & 0x1FF) << 4) as u16);
+                l = r;
 
-                    l += size;
+                if segments.len() > 105 {
+                    break;
+                }
+            }
 
-                    raw.push((lo & 0xF) as u16 | ((size & 0x1FF) << 4) as u16);
+            if segments.len() <= 105 {
+                let mut raw_data = vec![];
+                for &segment in segments.iter() {
+                    raw_data.extend(segment.to_le_bytes());
                 }
 
-                if raw.len() <= 105 {
-                    Some(raw)
-                } else {
-                    None
-                }
-            };
-
-            match segments {
-                None => {
-                    codes.insert(0, 0);
-                    let Ok(_) = stream.write_all(&codes) else {
-                        println!("Not able to send row {i}");
-                        return;
-                    };
-                }
-                Some(segments) => {
-                    let Ok(_) = stream.write_u8(segments.len() as u8) else {
-                        println!("Not able to send compressed row {i}");
-                        return;
-                    };
-
-                    let mut raw_data = vec![];
-                    for &segment in segments.iter() {
-                        let x = segment.to_le_bytes();
-                        raw_data.extend(&x);
-                    }
-
-                    let Ok(_) = stream.write(&raw_data) else {
-                        println!("Not able to send compressed row {i}");
-                        return;
-                    };
-                }
+                raw_data.insert(0, segments.len() as u8);
+                // let Ok(_) = stream.write_all(&raw_data) else {
+                //     println!("Not able to send compressed row {i}");
+                //     return;
+                // };
+                client.write_all(&raw_data);
+            } else {
+                codes.insert(0, 0);
+                // let Ok(_) = stream.write_all(&codes) else {
+                //     println!("Not able to send row {i}");
+                //     return;
+                // };
+                client.write_all(&codes);
             }
 
             pb.inc();
         }
+
+        client.flush();
         pb.finish_println("");
     }
 }
