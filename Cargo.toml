@@ -1,7 +1,11 @@
 [package]
 name = "arduino-wifi-tft-lcd-canvas-server"
+description = "Server for the Arduino WiFi TFT LCD Canvas App"
 version = "1.0.0"
 edition = "2021"
+readme = "README.md"
+license-file = "LICENSE"
+repository = "https://github.com/Aditya-A-garwal/arduino-wifi-tft-lcd-canvas-server"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
