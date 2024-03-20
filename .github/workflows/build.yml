@@ -15,7 +15,7 @@ jobs:
             ~/.platformio/.cache
           key: ${{ runner.os }}-pio
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Build the project
         run: cargo build --release
