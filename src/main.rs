@@ -1,20 +1,28 @@
 #![feature(iter_array_chunks)]
 
+#![doc(html_favicon_url = "https://i0.wp.com/dumblebots.com/wp-content/uploads/2023/12/dumblebots-logo-round.png")]
+#![doc(html_logo_url = "https://i0.wp.com/dumblebots.com/wp-content/uploads/2023/12/dumblebots-logo-round.png")]
+
+//! # Arduino WiFI TFT LCD Canvas Server
+//! Server for the [Arduino WiFi TFT LCD Canvas App](https://github.com/Aditya-A-garwal/Arduino-WiFi-TFT-LCD-Canvas-App).
+
 mod image;
 
-use core::time;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::thread::{self, Thread};
-
-use byteorder::{LittleEndian, WriteBytesExt};
-use pbr::ProgressBar;
+use std::thread::{self};
 
 use clap::Parser;
+use pbr::ProgressBar;
 
 use image::*;
 
-const BUFFER_CAPACITY: usize = 640;
+/// Width of the progress bar in characters
+const PROGRESS_BAR_WIDTH: usize = 96;
+/// Period of time to wait for the client's request for the next chunk, before the communication is terminated (considered failed)
+const SOCKET_TIMEOUT: Option<std::time::Duration> = Some(std::time::Duration::from_secs(8));
+/// Whether to display the progress bar or not
+const SHOW_PROGRESS_BAR: bool = true;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -28,71 +36,87 @@ struct Args {
     image_dir: String,
 }
 
-struct BufferedWriter {
-    stream: TcpStream,
-    buf: [u8; BUFFER_CAPACITY],
-    size: usize,
-}
+fn main() {
+    let args = Args::parse();
 
-impl BufferedWriter {
+    let host = "0.0.0.0";
+    let port = args.port;
 
-    fn new(mut stream: TcpStream) -> Self {
-        BufferedWriter {
-            stream,
-            buf: [0u8; BUFFER_CAPACITY],
-            size: 0,
+    let image_dir = args.image_dir;
+
+    println!();
+    println!("Starting Dumblebots Arduino Canvas Server...");
+    println!();
+
+    match std::fs::create_dir(&image_dir) {
+        Ok(()) => println!("Successfully created images directory"),
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                println!("Found image directory")
+            } else {
+                eprintln!("Failed to create image directory");
+                return;
+            }
+        }
+    };
+
+    let listener = match TcpListener::bind((host, port)) {
+        Ok(listener) => listener,
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!("Permission denied while binding server to port {}", port);
+                eprintln!("hint: use sudo on linux");
+            } else {
+                eprintln!("Failed to bind server to port {}", port);
+            }
+            return;
+        }
+    };
+
+    if let Ok(local_ip_addr) = local_ip_address::local_ip() {
+        println!("Waiting for request on \"{:?}:{}\"", local_ip_addr, port)
+    } else {
+        println!("Waiting for requests on port \"{}\"", port);
+    }
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let dir = image_dir.clone();
+                thread::spawn(move || {
+                    serve_client(stream, &dir);
+                });
+            }
+            Err(e) => {
+                eprintln!("Failed to accept connection: {}", e);
+            }
         }
     }
-
-    fn write_all(&mut self, bytes: &[u8]) {
-
-        use core::cmp::min;
-
-        let mut idx = 0usize;
-        let mut len = bytes.len();
-
-        while len > 0 {
-
-            if self.size == BUFFER_CAPACITY {
-                self.flush();
-            }
-
-            let mut inc = min(len, BUFFER_CAPACITY - self.size);
-            len -= inc;
-
-            while inc > 0 {
-                self.buf[self.size] = bytes[idx];
-
-                self.size += 1;
-                idx += 1;
-
-                inc -= 1;
-            }
-        };
-    }
-
-    fn flush(&mut self) {
-
-        let _ = self.stream.read_exact(&mut [0u8]);
-        // let _ = self.stream.write_u8(self.size as u8);
-        let _ = self.stream.write_u16::<LittleEndian>(self.size as u16);
-        let _ = self.stream.write_all(&self.buf);
-        self.size = 0;
-    }
 }
 
-fn handle_client(mut stream: TcpStream, dir: &str) {
-    let loading_bar_width = 96;
+/// Serves a single request from a single client
+///
+/// # Arguments
+///
+/// * `stream` - TCP connection with the client
+///
+fn serve_client(mut stream: TcpStream, dir: &str) {
+    let mut buffer = [0; 6];
 
-    let Ok(peer) = stream.peer_addr() else {
-        println!("Failed to read peer");
+    // try to set the timeout for this connection
+    let Ok(()) = stream.set_read_timeout(SOCKET_TIMEOUT) else {
+        eprintln!("Failed to set timeout for socket");
         return;
     };
 
-    // get the first give bytes, which are the image ID and dimensions
-    let mut buffer = [0; 6];
-    let Ok(_) = stream.read_exact(&mut buffer) else {
-        println!("Failed Request");
+    // try to get the address of the client
+    let Ok(peer) = stream.peer_addr() else {
+        eprintln!("Failed to read peer for request");
+        return;
+    };
+
+    let Ok(()) = stream.read_exact(&mut buffer) else {
+        eprintln!("Failed Request");
         return;
     };
 
@@ -104,193 +128,222 @@ fn handle_client(mut stream: TcpStream, dir: &str) {
     if rw == 1 {
         println!(
             r#"
-            Receiving new image from "{peer}" with
-            Dimensions: {height} x {width}
-            name: image_{name}.bmp
-            "#
+            Saving new image from "{}" with
+            Dimensions: {} x {}
+            name: image_{}.bmp
+            "#,
+            peer, height, width, name
         );
-
-        let mut img = Vec::with_capacity(height);
-
-        let mut pb = ProgressBar::new(height as u64);
-        pb.set_width(Some(loading_bar_width));
-
-        for row in 0..height {
-            let mut mode = [0u8];
-            let mut codes = vec![0; width];
-
-            let Ok(_) = stream.read_exact(&mut mode) else {
-                println!("Error reading mode");
-                return;
-            };
-
-            if mode[0] == 0 {
-                // normal mode
-                let Ok(_) = stream.read_exact(&mut codes) else {
-                    println!("Error reading row {row}");
-                    return;
-                };
-            } else {
-                // compressed mode
-                let mut segments_bytes = vec![0u8; 2 * (mode[0] as usize)];
-                let mut segments = vec![0u16; mode[0] as usize];
-
-                let Ok(_) = stream.read_exact(&mut segments_bytes) else {
-                    println!("Error reading compressed row {row}");
-                    return;
-                };
-
-                segments
-                    .iter_mut()
-                    .zip(segments_bytes.into_iter().array_chunks::<2>())
-                    .for_each(|(seg, pair)| *seg = u16::from_le_bytes(pair));
-
-                let mut idx = 0;
-                for &segment in segments.iter() {
-                    let code = (segment & 0xF) as u8;
-                    let count = ((segment >> 4) & 0x1FF) as usize;
-
-                    codes
-                        .iter_mut()
-                        .skip(idx)
-                        .take(count)
-                        .for_each(|v| *v = code);
-                    idx += count;
-                }
-            }
-            img.push(codes.iter().map(|&v| code_2_color(v).unwrap()).collect());
-            pb.inc();
-
-            // thread::sleep(time::Duration::from_millis(5));
-        }
-        pb.finish_println("");
-
-        save_bmp_image(&img, &format!("{dir}/image_{name}"));
+        save_image(height, width, name, stream, dir);
     } else if rw == 2 {
         println!(
             r#"
-            Sending new image to "{peer}" with
-            Dimensions: {height} x {width}
-            name: image_{name}.bmp
-            "#
+            Loading new image to "{}" with
+            Dimensions: {} x {}
+            name: image_{}.bmp
+            "#,
+            peer, height, width, name
         );
-
-        let mut client = BufferedWriter::new(stream);
-
-        let img = load_bmp_image(&format!("{dir}/image_{name}"));
-
-        let mut pb = ProgressBar::new(height as u64);
-        pb.set_width(Some(loading_bar_width));
-
-        for (i, row) in img.iter().enumerate() {
-            let mut codes: Vec<u8> = (*row).iter().map(|&v| color_2_code(v).unwrap()).collect();
-
-            let mut segments = vec![];
-
-            let mut l = 0;
-            let mut r = 0;
-
-            while l < codes.len() {
-
-                let lo = codes[l];
-
-                r = l + 1;
-                while r <= codes.len() {
-                    if (r == codes.len()) || (codes[r] != lo) {
-                        break;
-                    }
-                    r += 1;
-                }
-                segments.push((lo & 0xF) as u16 | (((r - l) & 0x1FF) << 4) as u16);
-                l = r;
-
-                if segments.len() > 105 {
-                    break;
-                }
-            }
-
-            if segments.len() <= 105 {
-                let mut raw_data = vec![];
-                for &segment in segments.iter() {
-                    raw_data.extend(segment.to_le_bytes());
-                }
-
-                raw_data.insert(0, segments.len() as u8);
-                // let Ok(_) = stream.write_all(&raw_data) else {
-                //     println!("Not able to send compressed row {i}");
-                //     return;
-                // };
-                client.write_all(&raw_data);
-            } else {
-                codes.insert(0, 0);
-                // let Ok(_) = stream.write_all(&codes) else {
-                //     println!("Not able to send row {i}");
-                //     return;
-                // };
-                client.write_all(&codes);
-            }
-
-            pb.inc();
-        }
-
-        client.flush();
-        pb.finish_println("");
+        load_image(height, width, name, stream, dir);
     }
 }
 
-fn main() {
-    let args = Args::parse();
+/// Saves an image sent from the client to the filesystem
+///
+/// # Arguments
+///
+/// * `height` - Number of rows in the image
+/// * `width` - Number of columns in the image
+/// * `stream` - TCP connection with the client
+/// * `name` - The slot number of the image
+/// * `dir` - Directory to save image to
+///
+fn save_image(height: usize, width: usize, name: u8, mut stream: TcpStream, dir: &str) {
+    let mut img = Vec::with_capacity(height);
 
-    // Define the host and port to listen on
-    let host = "0.0.0.0";
-    let port = args.port;
-
-    // Name of images directory
-    let image_dir = args.image_dir;
-
-    // create the folder where images are stored
-    match std::fs::create_dir(&image_dir) {
-        Ok(()) => println!("Successfully created images directory"),
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                println!("Found image directory")
-            } else {
-                panic!("Failed to create image directory");
-            }
+    let mut pb = match SHOW_PROGRESS_BAR {
+        false => None,
+        true => {
+            let mut pb = ProgressBar::new(height as u64);
+            pb.set_width(Some(PROGRESS_BAR_WIDTH));
+            Some(pb)
         }
     };
 
-    // Bind to the host and port
-    let listener = match TcpListener::bind((host, port)) {
-        Ok(listener) => listener,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::PermissionDenied {
-                println!("Permission denied while binding server to port {port}");
-                println!("hint: use sudo on linux");
-            } else {
-                println!("Failed to bind server to port {port}");
-            }
+    for row in 0..height {
+        let mut mode = [0u8];
+        let mut codes = vec![0; width];
+
+        let Ok(_) = stream.read_exact(&mut mode) else {
+            eprintln!("Error reading mode");
             return;
+        };
+
+        if mode[0] == 0 {
+            let Ok(_) = stream.read_exact(&mut codes) else {
+                eprintln!("Error reading row {}", row);
+                return;
+            };
+        } else {
+            let mut segments_bytes = vec![0u8; 2 * (mode[0] as usize)];
+            let mut segments = vec![0u16; mode[0] as usize];
+
+            let Ok(_) = stream.read_exact(&mut segments_bytes) else {
+                eprintln!("Error reading compressed row {}", row);
+                return;
+            };
+
+            segments
+                .iter_mut()
+                .zip(segments_bytes.into_iter().array_chunks::<2>())
+                .for_each(|(seg, pair)| *seg = u16::from_le_bytes(pair));
+
+            uncompress(&segments, &mut codes);
+        }
+        img.push(codes.iter().map(|&v| code_2_color(v).unwrap()).collect());
+
+        match &mut pb {
+            Some(pb) => pb.inc(),
+            None => 0,
+        };
+    }
+    match &mut pb {
+        Some(pb) => pb.finish_println(""),
+        None => (),
+    };
+
+    save_bmp_image(&img, &format!("{dir}/image_{name}"));
+}
+
+/// Loads an image from the filesystem to the client
+///
+/// # Arguments
+///
+/// * `expected_height` - Number of rows in the image as expected by the client
+/// * `expected_width` - Number of columns in the image as expected by the client
+/// * `stream` - TCP connection with the client
+/// * `name` - The slot number of the image
+/// * `dir` - Directory to retrieve the image from
+///
+fn load_image(
+    expected_height: usize,
+    expected_width: usize,
+    name: u8,
+    mut stream: TcpStream,
+    dir: &str,
+) {
+    let img = load_bmp_image(
+        &format!("{dir}/image_{name}"),
+        expected_width,
+        expected_height,
+    );
+
+    let mut pb = match SHOW_PROGRESS_BAR {
+        false => None,
+        true => {
+            let mut pb = ProgressBar::new(expected_height as u64);
+            pb.set_width(Some(PROGRESS_BAR_WIDTH));
+            Some(pb)
         }
     };
 
-    // println!("TCP server is listening on {}:{}", host, port);
-    println!("Waiting for requests on port {}", port);
+    for (i, row) in img.iter().enumerate() {
+        let codes: Vec<u8> = (*row).iter().map(|&v| color_2_code(v).unwrap()).collect();
 
-    // Accept incoming connections
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let dir = image_dir.clone();
+        let Ok(()) = stream.write_all(&codes) else {
+            eprintln!("Error while sending row {}", i);
+            return;
+        };
+        let Ok(()) = stream.flush() else {
+            eprintln!("Error while flushing row {}", i);
+            return;
+        };
 
-                // Spawn a new thread to handle each client connection
-                thread::spawn(move || {
-                    handle_client(stream, &dir);
-                });
-            }
-            Err(e) => {
-                eprintln!("Failed to accept connection: {}", e);
-            }
+        if (i % 10) == 0 {
+            let Ok(()) = stream.read_exact(&mut [0u8]) else {
+                eprintln!("Not received confirmation after row {}", i);
+                return;
+            };
         }
+        match &mut pb {
+            Some(pb) => pb.inc(),
+            None => 0,
+        };
     }
+
+    let Ok(()) = stream.read_exact(&mut [0u8]) else {
+        println!("Not recieved final confirmation");
+        return;
+    };
+    match &mut pb {
+        Some(pb) => pb.finish_println(""),
+        None => (),
+    };
+}
+
+/// Uncompress a row from segment-representation into its pixel-representation and get the number of pixels
+///
+/// # Arguments
+///
+/// * `segments` - Slice of 16-bit integers, each representing a valid segment with a code and size
+/// * `codes` - Mutable slice of 8-bit integers, where the uncompressed data must be stored
+///
+pub fn uncompress(segments: &[u16], codes: &mut [u8]) -> usize {
+    let mut idx = 0;
+
+    for &segment in segments.iter() {
+        let code = (segment & 0xF) as u8;
+        let count = ((segment >> 4) & 0x1FF) as usize;
+
+        if codes.len() < (idx + count) {
+            break;
+        }
+
+        codes
+            .iter_mut()
+            .skip(idx)
+            .take(count)
+            .for_each(|v| *v = code);
+        idx += count;
+    }
+
+    idx
+}
+
+/// Compresse a row from pixel-representation into its segment-representation and get the number of segments, pixels
+///
+/// # Arguments
+///
+/// * `segments` - Mutable slice of 16-bit integers, where the compressed data must be stored
+/// * `codes` - Slice of 8-bit integers, each representing a valid code
+///
+pub fn compress(segments: &mut [u16], codes: &[u8]) -> (usize, usize) {
+    let mut num_segments = 0usize;
+    let mut num_pixels = 0usize;
+
+    let mut code_it = codes.iter().enumerate();
+    let mut segment_it = segments.iter_mut();
+
+    while let Some((l, &lo)) = code_it.next() {
+        let r = codes
+            .iter()
+            .skip(l + 1)
+            .position(|&hi| hi != lo)
+            .unwrap_or(codes.len());
+
+        let code = (lo & 0xF) as u16;
+        let count = ((r - l) & 0x1FF) as u16;
+
+        let Some(segment) = segment_it.next() else {
+            break;
+        };
+
+        *segment = (count << 4) | code;
+        num_segments += 1;
+        num_pixels += r - l;
+
+        code_it.nth(r - 1);
+    }
+
+    (num_segments, num_pixels)
 }
